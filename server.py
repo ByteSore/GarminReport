@@ -1,22 +1,110 @@
 from flask import Flask, jsonify, request
-from garminconnect import Garmin
 import os
 from datetime import date
+from pathlib import Path
+
+import requests
+
+from garth.exc import GarthException, GarthHTTPError
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 app = Flask(__name__)
+global client
 client = None
+live = False
 
-def init_garmin():
-    global client
+if live:
+    gemail_path = '/run/secrets/garmin_email.txt'
+    gpassword_path = '/run/secrets/garmin_password.txt'
+    genv_path = '/root/.garminconnect'
+else:
+    gemail_path = 'secrets/garmin_email.txt'
+    gpassword_path = 'secrets/garmin_password.txt'
+    genv_path = 'tokens'
+    
+def init_garmin() -> Garmin | None:
+    """Initialize Garmin API with authentication and token management."""
+    # Configure token storage
+    tokenstore_path = Path(genv_path).expanduser()
+    # Check if token files exist
+    if tokenstore_path.exists():
+        token_files = list(tokenstore_path.glob("*.json"))
+        if token_files:
+            pass
+        else:
+            pass
+    else:
+        pass
+
+    # First try to login with stored tokens
     try:
-        email = open('/run/secrets/garmin_email').read().strip()
-        password = open('/run/secrets/garmin_password').read().strip()
-        client = Garmin(email, password)
-        client.garth.load('/root/.garminconnect')
-        client.display_name = client.garth.profile['displayName']
-        print(f"Tokens geladen OK, gebruiker: {client.display_name}")
-    except Exception as e:
-        print(f"Garmin login mislukt: {e}")
+        garmin = Garmin()
+        garmin.login(str(tokenstore_path))
+        return garmin
+
+    except (
+        FileNotFoundError,
+        GarthHTTPError,
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+    ):
+        pass
+
+    # Loop for credential entry with retry on auth failure
+    while True:
+        try:
+            # Get credentials
+            email = open(gemail_path).read().strip()
+            password = open(gpassword_path).read().strip()
+
+            garmin = Garmin(
+                email=email, password=password, is_cn=False, return_on_mfa=True
+            )
+            result1, result2 = garmin.login()
+
+            if result1 == "needs_mfa":
+                mfa_code = input("Please enter your MFA code: ")
+
+                try:
+                    garmin.resume_login(result2, mfa_code)
+
+                except GarthHTTPError as garth_error:
+                    # Handle specific HTTP errors from MFA
+                    error_str = str(garth_error)
+                    if "429" in error_str and "Too Many Requests" in error_str:
+                        sys.exit(1)
+                    elif "401" in error_str or "403" in error_str:
+                        continue
+                    else:
+                        # Other HTTP errors - don't retry
+                        sys.exit(1)
+
+                except GarthException:
+                    continue
+
+            # Save tokens for future use
+            garmin.garth.dump(str(tokenstore_path))
+            return garmin
+
+        except GarminConnectAuthenticationError:
+            # Continue the loop to retry
+            continue
+
+        except (
+            FileNotFoundError,
+            GarthHTTPError,
+            GarminConnectConnectionError,
+            requests.exceptions.HTTPError,
+        ):
+            return None
+
+        except KeyboardInterrupt:
+            return None
 
 # ── Bestaande routes ──────────────────────────────────────────────────────────
 
@@ -201,5 +289,5 @@ def persoonlijke_records():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    init_garmin()
+    client = init_garmin()
     app.run(host='0.0.0.0', port=8080, debug=False)
